@@ -4,11 +4,14 @@ for i = 0, MAX_PLAYERS - 1 do
         faceAngleAnim = 0,
         tiltAngleAnim = 0,
         wasUnderwater = false,
+        slamFVel = 0,
     }
 end
 
 local ACT_ZONIC_WALKING = allocate_mario_action(ACT_GROUP_MOVING)
 local ACT_ZONIC_ROLL = allocate_mario_action(ACT_GROUP_MOVING | ACT_FLAG_SHORT_HITBOX)
+local ACT_ZONIC_SLAM = allocate_mario_action(ACT_GROUP_AIRBORNE | ACT_FLAG_AIR)
+local ACT_ZONIC_SLAM_LAND = allocate_mario_action(ACT_GROUP_STATIONARY)
 
 local function is_underwater(m)
     return m.pos.y + 140 < m.waterLevel
@@ -206,6 +209,7 @@ end
 
 ---@param m MarioState
 local function act_zonic_roll(m)
+    if not m then return 0 end
     local isSpindash = m.actionArg == 1
     if not isSpindash then
         if m.actionTimer > 20 then
@@ -262,8 +266,77 @@ local function act_zonic_roll(m)
     end
 end
 
+---@param m MarioState
+local function act_zonic_slam(m)
+    if not m then return 0 end
+    local e = gZonicStates[m.playerIndex]
+
+    if m.actionState == 0 then
+        e.slamFVel = m.forwardVel
+        m.actionState = m.actionState + 1
+    end
+
+    play_sound_if_no_flag(m, SOUND_ACTION_THROW, MARIO_ACTION_SOUND_PLAYED);
+    set_character_animation(m, CHAR_ANIM_GROUND_POUND);
+
+    local stepResult = perform_air_step(m, 0);
+    m.forwardVel = 0
+    m.vel.x = 0
+    m.vel.z = 0
+    m.vel.y = -100
+    if (stepResult == AIR_STEP_LANDED) then
+        if (should_get_stuck_in_ground(m) ~= 0) then
+            queue_rumble_data_mario(m, 5, 80);
+            play_character_sound(m, CHAR_SOUND_OOOF);
+            set_mario_particle_flags(m, PARTICLE_MIST_CIRCLE, 0);
+            set_mario_action(m, ACT_BUTT_STUCK_IN_GROUND, 0);
+        else
+            play_mario_heavy_landing_sound(m, SOUND_ACTION_TERRAIN_HEAVY_LANDING);
+            if (check_fall_damage(m, ACT_HARD_BACKWARD_GROUND_KB) == 0) then
+                set_mario_particle_flags(m, (PARTICLE_MIST_CIRCLE | PARTICLE_HORIZONTAL_STAR), 0);
+                set_mario_action(m, ACT_GROUND_POUND_LAND, 0);
+            end
+        end
+        if (m.playerIndex == 0) then set_camera_shake_from_hit(SHAKE_GROUND_POUND); end
+    end
+end
+
+---@param m MarioState
+local function act_zonic_slam_land(m)
+    if not m then return 0 end
+    local e = gZonicStates[m.playerIndex]
+    m.actionState = 1;
+    if (m.input & INPUT_UNKNOWN_10 ~= 0) then
+        return drop_and_set_mario_action(m, ACT_SHOCKWAVE_BOUNCE, 0);
+    end
+
+    if (m.input & INPUT_OFF_FLOOR ~= 0) then
+        return set_mario_action(m, ACT_FREEFALL, 0);
+    end
+
+    if (m.input & INPUT_ABOVE_SLIDE ~= 0) then
+        m.forwardVel = e.slamFVel
+        return set_mario_action(m, ACT_ZONIC_ROLL, 0);
+    end
+
+    if m.input & INPUT_A_PRESSED ~= 0 then
+        m.forwardVel = e.slamFVel*0.95
+        m.faceAngle.y = m.intendedYaw
+        return set_mario_action(m, ACT_JUMP, 0);
+    end
+
+    if m.input & INPUT_B_PRESSED ~= 0 then
+        return set_mario_action(m, ACT_ZONIC_ROLL, 1);
+    end
+
+    landing_step(m, CHAR_ANIM_GROUND_POUND_LANDING, ACT_BUTT_SLIDE_STOP);
+    return 0;
+end
+
 hook_mario_action(ACT_ZONIC_WALKING, act_zonic_walking)
 hook_mario_action(ACT_ZONIC_ROLL, act_zonic_roll, INT_SLIDE_KICK)
+hook_mario_action(ACT_ZONIC_SLAM, act_zonic_slam, INT_GROUND_POUND)
+hook_mario_action(ACT_ZONIC_SLAM_LAND, act_zonic_slam_land, INT_GROUND_POUND)
 
 local function before_action(m, nextAct, nextArg)
     if nextAct == ACT_WALKING then
@@ -276,7 +349,16 @@ local function before_action(m, nextAct, nextArg)
         return set_mario_action(m, ACT_ZONIC_ROLL, 1)
     end
     if nextAct == ACT_STEEP_JUMP then
-        return set_mario_action(m, ACT_JUMP, 1)
+        return set_mario_action(m, ACT_JUMP, 0)
+    end
+    if nextAct == ACT_GROUND_POUND then
+        return set_mario_action(m, ACT_ZONIC_SLAM, 0)
+    end
+    if nextAct == ACT_GROUND_POUND_LAND then
+        return set_mario_action(m, ACT_ZONIC_SLAM_LAND, 0)
+    end
+    if nextAct == ACT_BUTT_SLIDE then
+        return set_mario_action(m, ACT_ZONIC_ROLL, 0)
     end
 end
 
@@ -287,12 +369,14 @@ end
 ---@param m MarioState
 local function zonic_update(m)
     local e = gZonicStates[m.playerIndex]
-    if is_underwater(m) then
-        m.vel.y = math.max(m.vel.y + 1, -50)
-        e.wasUnderwater = true
-    elseif e.wasUnderwater then
-        m.vel.y = m.vel.y * 2
-        e.wasUnderwater = false
+    if e.wasUnderwater ~= is_underwater(m) then
+        set_mario_particle_flags(m, PARTICLE_WATER_SPLASH, 0);
+        if is_underwater(m) then
+            m.vel.y = math.max(m.vel.y + 1, -50)
+        elseif e.wasUnderwater then
+            m.vel.y = m.vel.y * 2
+        end
+        e.wasUnderwater = is_underwater(m)
     end
 end
 
